@@ -29,18 +29,76 @@ const DAYS = Array.from({ length: 10 }, (_, i) => {
 function genId() { return Math.random().toString(36).slice(2,10); }
 
 // ─── AI helpers ───────────────────────────────────────────────────────────────
-async function callClaude(prompt) {
+// ─── API Key ──────────────────────────────────────────────────────────────────
+// Replace the empty string below with your Anthropic API key to enable AI features.
+// Get one free at: https://console.anthropic.com
+// IMPORTANT: For a public app, use an environment variable instead of pasting the key here.
+// In Vercel: add REACT_APP_ANTHROPIC_API_KEY in Settings → Environment Variables
+// then reference it as: process.env.REACT_APP_ANTHROPIC_API_KEY
+const ANTHROPIC_API_KEY = process.env.REACT_APP_ANTHROPIC_API_KEY || "";
+
+// callClaude — calls the Anthropic API with optional extra body params (e.g. tools)
+async function callClaude(prompt, extraBody={}) {
+  if (!ANTHROPIC_API_KEY) {
+    throw new Error("No API key set. Add your Anthropic API key to enable AI features.");
+  }
   const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({ model:"claude-sonnet-4-20250514", max_tokens:1000, messages:[{role:"user",content:prompt}] })
+    method:"POST",
+    headers:{
+      "Content-Type":"application/json",
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true"
+    },
+    body: JSON.stringify({
+      model:"claude-sonnet-4-20250514",
+      max_tokens:2000,
+      messages:[{role:"user",content:prompt}],
+      ...extraBody
+    })
   });
   const data = await res.json();
-  return data.content?.map(b => b.text||"").join("") || "";
+  if (data.error) throw new Error(data.error.message || "API error");
+  // Collect all text blocks (web_search returns multiple blocks)
+  return (data.content||[]).map(b => b.type==="text" ? b.text : "").join("");
 }
-async function parseRecipeFromUrl(url) {
-  const text = await callClaude(`You are a recipe parser. Given this URL: ${url}\nGenerate a realistic recipe. Respond ONLY with valid JSON, no markdown:\n{"name":"Recipe Name","ingredients":["1 cup flour"],"instructions":"Steps...","cookingTime":"30 minutes","tags":["Tag1"],"sourceUrl":"${url}"}`);
-  try { return JSON.parse(text.replace(/\`\`\`json|\`\`\`/g,"")); } catch { return null; }
+
+// parseRecipeFromUrl — uses Claude's web_search tool to actually visit and read the page
+async function parseRecipeFromUrl(url, onStatus) {
+  onStatus("Visiting the recipe page\u2026");
+  const prompt =
+    `Visit this URL and extract the full recipe from it: ${url}\n\n` +
+    `You MUST use your web_search tool to actually read the page.\n` +
+    `Then respond ONLY with a single valid JSON object — no markdown, no backticks, no explanation before or after.\n` +
+    `If you cannot find a recipe, respond with exactly: {"error":"no recipe found"}\n\n` +
+    `Required JSON format (fill in real values from the page):\n` +
+    `{` +
+    `"name":"Recipe Name",` +
+    `"ingredients":["200g pasta","2 tbsp olive oil","3 garlic cloves"],` +
+    `"instructions":"Step 1: ... Step 2: ... Step 3: ...",` +
+    `"cookingTime":"30 minutes",` +
+    `"tags":["Vegetarian","Quick","Pasta"],` +
+    `"sourceUrl":"${url}"` +
+    `}`;
+
+  onStatus("Extracting ingredients and instructions\u2026");
+  const result = await callClaude(prompt, {
+    tools:[{ type:"web_search_20250305", name:"web_search" }]
+  });
+
+  const cleaned = result.replace(/```json|```/g,"").trim();
+  // Extract JSON — find the first { ... } block in the response
+  const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new Error("Could not extract the recipe. Make sure the URL points directly to a recipe page.");
+  let parsed;
+  try { parsed = JSON.parse(jsonMatch[0]); }
+  catch { throw new Error("Could not read the recipe data. Please try again."); }
+  if (parsed.error || !parsed.name) {
+    throw new Error("No recipe was found at that URL. Try a URL that points directly to a single recipe (not a search page or homepage).");
+  }
+  return parsed;
 }
+
 async function recommendRecipe(recipes, context) {
   if (!recipes.length) return "No recipes in library yet. Add some first!";
   const list = recipes.map(r => `- ${r.name} (tags: ${r.tags?.join(", ")}, rating: ${r.rating||0}/5)`).join("\n");
@@ -298,6 +356,7 @@ export default function MealPlanner() {
   const [importUrl, setImportUrl] = useState("");
   const [importLoading, setImportLoading] = useState(false);
   const [importError, setImportError] = useState("");
+  const [importStatus, setImportStatus] = useState("");
   const [recommendContext, setRecommendContext] = useState("");
   const [recommendResult, setRecommendResult] = useState("");
   const [recommendLoading, setRecommendLoading] = useState(false);
@@ -340,13 +399,12 @@ export default function MealPlanner() {
 
   async function handleUrlImport() {
     if(!importUrl.trim())return;
-    setImportLoading(true); setImportError("");
+    setImportLoading(true); setImportError(""); setImportStatus("");
     try {
-      const r=await parseRecipeFromUrl(importUrl.trim());
-      if(!r?.name)throw new Error();
+      const r=await parseRecipeFromUrl(importUrl.trim(), setImportStatus);
       persistRecipes([...recipes,{...r,id:genId(),rating:0}]);
-      setShowUrlImport(false); setImportUrl("");
-    } catch { setImportError("Could not extract recipe. Try a different URL."); }
+      setShowUrlImport(false); setImportUrl(""); setImportStatus("");
+    } catch(e) { setImportError(e.message||"Could not extract recipe. Try a different URL."); }
     setImportLoading(false);
   }
 
@@ -540,15 +598,27 @@ export default function MealPlanner() {
         </Modal>
       )}
       {showUrlImport&&(
-        <Modal title="Import from URL" onClose={()=>{setShowUrlImport(false);setImportUrl("");setImportError("");}}>
-          <p style={{ color:"#6b7280",fontSize:14,margin:"0 0 14px",lineHeight:1.6 }}>Paste a recipe URL and AI will extract the details automatically.</p>
-          <input value={importUrl} onChange={e=>setImportUrl(e.target.value)} onKeyDown={e=>e.key==="Enter"&&handleUrlImport()} style={inp} placeholder="https://www.example.com/recipes/…" />
-          {importError&&<p style={{ color:"#ef4444",fontSize:13,margin:"8px 0 0" }}>{importError}</p>}
+        <Modal title="🔗 Import from URL" onClose={()=>{setShowUrlImport(false);setImportUrl("");setImportError("");setImportStatus("");}}>
+          <p style={{ color:"#6b7280",fontSize:14,margin:"0 0 6px",lineHeight:1.6 }}>Paste any recipe URL. The app will visit the page and extract the real recipe automatically.</p>
+          <p style={{ color:"#9ca3af",fontSize:12,margin:"0 0 14px",lineHeight:1.5 }}>Works with AllRecipes, BBC Good Food, NYT Cooking, Serious Eats, and most recipe sites.</p>
+          <input value={importUrl} onChange={e=>{setImportUrl(e.target.value);setImportError("");}} onKeyDown={e=>e.key==="Enter"&&handleUrlImport()} style={inp} placeholder="https://www.allrecipes.com/recipe/…" disabled={importLoading} />
+          {importLoading&&importStatus&&(
+            <div style={{ display:"flex",alignItems:"center",gap:8,marginTop:10,padding:"10px 14px",background:"#f5f3ff",borderRadius:10,border:"1px solid #ddd6fe" }}>
+              <span style={{ fontSize:16 }}>⏳</span>
+              <span style={{ fontSize:13,color:"#6366f1",fontWeight:600,fontFamily:"'DM Sans',sans-serif" }}>{importStatus}</span>
+            </div>
+          )}
+          {importError&&(
+            <div style={{ display:"flex",alignItems:"flex-start",gap:8,marginTop:10,padding:"10px 14px",background:"#fef2f2",borderRadius:10,border:"1px solid #fecaca" }}>
+              <span style={{ fontSize:15,flexShrink:0 }}>⚠️</span>
+              <span style={{ fontSize:13,color:"#dc2626",lineHeight:1.5,fontFamily:"'DM Sans',sans-serif" }}>{importError}</span>
+            </div>
+          )}
           <div style={{ display:"flex",gap:10,marginTop:16,flexWrap:"wrap" }}>
-            <button onClick={handleUrlImport} disabled={importLoading} style={{ ...btnP,opacity:importLoading?.55:1 }}>
-              {importLoading?"⏳ Extracting…":"🔗 Import Recipe"}
+            <button onClick={handleUrlImport} disabled={importLoading||!importUrl.trim()} style={{ ...btnP,opacity:(importLoading||!importUrl.trim())?.55:1 }}>
+              {importLoading?"⏳ Importing…":"🔗 Import Recipe"}
             </button>
-            <button onClick={()=>setShowUrlImport(false)} style={btnS}>Cancel</button>
+            <button onClick={()=>{setShowUrlImport(false);setImportUrl("");setImportError("");setImportStatus("");}} disabled={importLoading} style={{ ...btnS,opacity:importLoading?.6:1 }}>Cancel</button>
           </div>
         </Modal>
       )}
